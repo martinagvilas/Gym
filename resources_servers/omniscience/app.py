@@ -31,7 +31,6 @@ https://huggingface.co/datasets/ArtificialAnalysis/AA-Omniscience-Public
 
 from __future__ import annotations
 
-import asyncio
 import re
 from pathlib import Path
 from typing import List, Optional, Union
@@ -150,23 +149,6 @@ class OmniscienceConfig(BaseResourcesServerConfig):
         description="Use /v1/chat/completions instead of /v1/responses for the judge model. "
         "Required for endpoints that don't support the OpenAI Responses API (e.g., NVIDIA API).",
     )
-    judge_timeout_seconds: float = Field(
-        default=180.0,
-        description="Per-call timeout in seconds for the judge model HTTP request. "
-        "Bounds silent-socket hangs on rate-limited or stalled judge endpoints. "
-        "Raises asyncio.TimeoutError if exceeded so the rollout slot is freed.",
-    )
-    judge_max_attempts: int = Field(
-        default=3,
-        description="Maximum number of judge HTTP attempts (including the first try) on "
-        "asyncio.TimeoutError. Mirrors Skills' litellm retry behavior so transient stalls "
-        "on the upstream judge endpoint do not crash the whole run.",
-    )
-    judge_retry_initial_backoff_seconds: float = Field(
-        default=1.0,
-        description="Initial backoff in seconds between judge retry attempts; doubles each "
-        "subsequent attempt (exponential backoff).",
-    )
 
 
 class OmniscienceRunRequest(BaseRunRequest):
@@ -253,29 +235,6 @@ class OmniscienceServer(SimpleResourcesServer):
 
         return metrics
 
-    async def _post_judge_with_retry(self, url_path: str, json_payload):
-        max_attempts = self.config.judge_max_attempts
-        if max_attempts < 1:
-            raise ValueError(f"judge_max_attempts must be >= 1, got {max_attempts}")
-        backoff = self.config.judge_retry_initial_backoff_seconds
-        last_exc: Optional[asyncio.TimeoutError] = None
-        for attempt in range(max_attempts):
-            try:
-                return await asyncio.wait_for(
-                    self.server_client.post(
-                        server_name=self.config.judge_model_server.name,
-                        url_path=url_path,
-                        json=json_payload,
-                    ),
-                    timeout=self.config.judge_timeout_seconds,
-                )
-            except asyncio.TimeoutError as e:
-                last_exc = e
-                if attempt + 1 < max_attempts:
-                    await asyncio.sleep(backoff * (2 ** attempt))
-        assert last_exc is not None
-        raise last_exc
-
     def get_key_metrics(self, agent_metrics: dict) -> dict:
         """Select headline metrics for omniscience benchmark."""
         key: dict = {}
@@ -314,7 +273,11 @@ class OmniscienceServer(SimpleResourcesServer):
                 temperature=self.config.judge_responses_create_params.temperature or 0.0,
                 top_p=self.config.judge_responses_create_params.top_p or 1.0,
             )
-            response_obj = await self._post_judge_with_retry("/v1/chat/completions", chat_params)
+            response_obj = await self.server_client.post(
+                server_name=self.config.judge_model_server.name,
+                url_path="/v1/chat/completions",
+                json=chat_params,
+            )
             chat_response = NeMoGymChatCompletion.model_validate(await response_obj.json())
             content = chat_response.choices[0].message.content if chat_response.choices else None
             judge_text = content.strip() if content else ""
@@ -325,7 +288,11 @@ class OmniscienceServer(SimpleResourcesServer):
             request_params = self.config.judge_responses_create_params.model_copy(deep=True)
             request_params.input = msgs
 
-            response_obj = await self._post_judge_with_retry("/v1/responses", request_params)
+            response_obj = await self.server_client.post(
+                server_name=self.config.judge_model_server.name,
+                url_path="/v1/responses",
+                json=request_params,
+            )
             judge_response = NeMoGymResponse.model_validate(await response_obj.json())
             judge_text = extract_text_from_response(judge_response)
 
