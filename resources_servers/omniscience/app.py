@@ -31,6 +31,7 @@ https://huggingface.co/datasets/ArtificialAnalysis/AA-Omniscience-Public
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 from typing import List, Optional, Union
@@ -148,6 +149,12 @@ class OmniscienceConfig(BaseResourcesServerConfig):
         default=False,
         description="Use /v1/chat/completions instead of /v1/responses for the judge model. "
         "Required for endpoints that don't support the OpenAI Responses API (e.g., NVIDIA API).",
+    )
+    judge_timeout_seconds: float = Field(
+        default=180.0,
+        description="Per-call timeout in seconds for the judge model HTTP request. "
+        "Bounds silent-socket hangs on rate-limited or stalled judge endpoints. "
+        "Raises asyncio.TimeoutError if exceeded so the rollout slot is freed.",
     )
 
 
@@ -270,10 +277,13 @@ class OmniscienceServer(SimpleResourcesServer):
                 temperature=self.config.judge_responses_create_params.temperature or 0.0,
                 top_p=self.config.judge_responses_create_params.top_p or 1.0,
             )
-            response_obj = await self.server_client.post(
-                server_name=self.config.judge_model_server.name,
-                url_path="/v1/chat/completions",
-                json=chat_params,
+            response_obj = await asyncio.wait_for(
+                self.server_client.post(
+                    server_name=self.config.judge_model_server.name,
+                    url_path="/v1/chat/completions",
+                    json=chat_params,
+                ),
+                timeout=self.config.judge_timeout_seconds,
             )
             chat_response = NeMoGymChatCompletion.model_validate(await response_obj.json())
             content = chat_response.choices[0].message.content if chat_response.choices else None
@@ -285,10 +295,13 @@ class OmniscienceServer(SimpleResourcesServer):
             request_params = self.config.judge_responses_create_params.model_copy(deep=True)
             request_params.input = msgs
 
-            response_obj = await self.server_client.post(
-                server_name=self.config.judge_model_server.name,
-                url_path="/v1/responses",
-                json=request_params,
+            response_obj = await asyncio.wait_for(
+                self.server_client.post(
+                    server_name=self.config.judge_model_server.name,
+                    url_path="/v1/responses",
+                    json=request_params,
+                ),
+                timeout=self.config.judge_timeout_seconds,
             )
             judge_response = NeMoGymResponse.model_validate(await response_obj.json())
             judge_text = extract_text_from_response(judge_response)
