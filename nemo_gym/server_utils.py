@@ -16,6 +16,7 @@ import asyncio
 import atexit
 import json
 import resource
+import socket
 import sys
 import time
 from abc import abstractmethod
@@ -110,6 +111,12 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
         connector=TCPConnector(
             limit=cfg.global_aiohttp_connector_limit // num_workers,
             limit_per_host=cfg.global_aiohttp_connector_limit_per_host // num_workers,
+            socket_options=[
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+                (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),
+                (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+                (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+            ],
         ),
         timeout=ClientTimeout(),
         cookie_jar=DummyCookieJar(),
