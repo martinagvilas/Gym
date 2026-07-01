@@ -31,9 +31,10 @@ https://huggingface.co/datasets/ArtificialAnalysis/AA-Omniscience-Public
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import yaml
 from fastapi import FastAPI
@@ -150,6 +151,18 @@ class OmniscienceConfig(BaseResourcesServerConfig):
         "Required for endpoints that don't support the OpenAI Responses API (e.g., NVIDIA API).",
     )
 
+    judge_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        description="Max attempts for a single judge call. On exhaustion the sample is "
+        "marked verdict='judge_error' and excluded from correct/incorrect/partial/abstained.",
+    )
+    judge_retry_initial_backoff_seconds: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="Initial sleep between judge retries; doubled after each failed attempt.",
+    )
+
 
 class OmniscienceRunRequest(BaseRunRequest):
     model_config = ConfigDict(extra="allow")
@@ -172,10 +185,12 @@ class OmniscienceVerifyResponse(BaseVerifyResponse):
     expected_answer: Optional[str] = None
     verdict: Optional[str] = None
     judge_output: Optional[str] = None
+    judge_error_message: Optional[str] = None
     is_correct: float = 0.0
     is_incorrect: float = 0.0
     is_partial: float = 0.0
     is_not_attempted: float = 0.0
+    is_judge_error: float = 0.0
     omniscience_index: float = 0.0
     is_hallucination: float = 0.0
 
@@ -202,13 +217,18 @@ class OmniscienceServer(SimpleResourcesServer):
         """Score function for compute_pass_majority_metrics.
 
         Maps judge verdicts to named scores matching Skills' OmniMetrics.
+        A verdict of ``judge_error`` (bounded-retry judge call failed) contributes
+        0.0 to every A/B/C/D bucket -- the sample is still counted in the
+        denominator so accuracy is diluted, but it is excluded from the
+        hallucination denominator, mirroring nemo-skills' OmniMetrics behavior.
         """
-        verdict = result.get("verdict", "incorrect")
+        verdict = result.get("verdict", "")
         return {
             "judge_correct": 1.0 if verdict == "correct" else 0.0,
             "judge_incorrect": -1.0 if verdict == "incorrect" else 0.0,
             "judge_partially_correct": 1.0 if verdict == "partial" else 0.0,
             "judge_abstained": 1.0 if verdict == "not_attempted" else 0.0,
+            "judge_error": 1.0 if verdict == "judge_error" else 0.0,
         }
 
     def compute_metrics(self, tasks: List[List[dict]]) -> dict:
@@ -245,6 +265,63 @@ class OmniscienceServer(SimpleResourcesServer):
         key.update(highest_k_metrics(agent_metrics, "pass@{k}", exclude_names=["no_answer"]))
         return key
 
+    async def _fetch_judge_body(self, url_path: str, json_body) -> Tuple[Optional[dict], str]:
+        response_obj = await self.server_client.post(
+            server_name=self.config.judge_model_server.name,
+            url_path=url_path,
+            json=json_body,
+        )
+        if response_obj.status != 200:
+            body_text = await response_obj.text()
+            return None, f"status={response_obj.status} body_prefix={body_text[:200]}"
+        parsed = await response_obj.json()
+        if not isinstance(parsed, dict):
+            return None, f"status=200 non_dict_body type={type(parsed).__name__} preview={str(parsed)[:200]}"
+        return parsed, ""
+
+    async def _call_judge_chat_with_retry(
+        self,
+        chat_params: NeMoGymChatCompletionCreateParamsNonStreaming,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        max_attempts = self.config.judge_max_attempts
+        backoff = self.config.judge_retry_initial_backoff_seconds
+        attempt = 0
+        last_error = "no attempt executed"
+        while attempt < max_attempts:
+            attempt += 1
+            body, err = await self._fetch_judge_body("/v1/chat/completions", chat_params)
+            if body is not None:
+                chat_response = NeMoGymChatCompletion.model_validate(body)
+                content = chat_response.choices[0].message.content if chat_response.choices else None
+                return (content.strip() if content else ""), None
+            last_error = f"attempt={attempt}/{max_attempts} {err}"
+            print(f"[omniscience judge retry chat] {last_error}", flush=True)
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return None, last_error
+
+    async def _call_judge_responses_with_retry(
+        self,
+        request_params: NeMoGymResponseCreateParamsNonStreaming,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        max_attempts = self.config.judge_max_attempts
+        backoff = self.config.judge_retry_initial_backoff_seconds
+        attempt = 0
+        last_error = "no attempt executed"
+        while attempt < max_attempts:
+            attempt += 1
+            body, err = await self._fetch_judge_body("/v1/responses", request_params)
+            if body is not None:
+                judge_response = NeMoGymResponse.model_validate(body)
+                return extract_text_from_response(judge_response), None
+            last_error = f"attempt={attempt}/{max_attempts} {err}"
+            print(f"[omniscience judge retry responses] {last_error}", flush=True)
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return None, last_error
+
     async def verify(self, body: OmniscienceVerifyRequest) -> OmniscienceVerifyResponse:
         # Match Skills' parse_reasoning=True behavior:
         # 1. <think>...</think> pair present: strip reasoning, keep answer after </think>
@@ -273,30 +350,39 @@ class OmniscienceServer(SimpleResourcesServer):
                 temperature=self.config.judge_responses_create_params.temperature or 0.0,
                 top_p=self.config.judge_responses_create_params.top_p or 1.0,
             )
-            response_obj = await self.server_client.post(
-                server_name=self.config.judge_model_server.name,
-                url_path="/v1/chat/completions",
-                json=chat_params,
-            )
-            chat_response = NeMoGymChatCompletion.model_validate(await response_obj.json())
-            content = chat_response.choices[0].message.content if chat_response.choices else None
-            judge_text = content.strip() if content else ""
+            judge_text, judge_error = await self._call_judge_chat_with_retry(chat_params)
         else:
             msgs: List[NeMoGymEasyInputMessage] = [
                 NeMoGymEasyInputMessage(role="user", content=judge_prompt),
             ]
             request_params = self.config.judge_responses_create_params.model_copy(deep=True)
             request_params.input = msgs
+            judge_text, judge_error = await self._call_judge_responses_with_retry(request_params)
 
-            response_obj = await self.server_client.post(
-                server_name=self.config.judge_model_server.name,
-                url_path="/v1/responses",
-                json=request_params,
+        if judge_error is not None:
+            print(
+                f"[omniscience verify] judge_error after {self.config.judge_max_attempts} "
+                f"attempts: {judge_error}",
+                flush=True,
             )
-            judge_response = NeMoGymResponse.model_validate(await response_obj.json())
-            judge_text = extract_text_from_response(judge_response)
+            return OmniscienceVerifyResponse(
+                **body.model_dump(exclude={"expected_answer", "extracted_answer"}),
+                reward=0.0,
+                extracted_answer=generation,
+                expected_answer=expected_answer,
+                verdict="judge_error",
+                judge_output="",
+                judge_error_message=judge_error,
+                is_correct=0.0,
+                is_incorrect=0.0,
+                is_partial=0.0,
+                is_not_attempted=0.0,
+                is_judge_error=1.0,
+                omniscience_index=0.0,
+                is_hallucination=0.0,
+            )
 
-        grade = parse_judge_grade(judge_text)
+        grade = parse_judge_grade(judge_text or "")
 
         if grade == "A":
             verdict = "correct"
@@ -329,6 +415,7 @@ class OmniscienceServer(SimpleResourcesServer):
             is_incorrect=is_incorrect,
             is_partial=is_partial,
             is_not_attempted=is_not_attempted,
+            is_judge_error=0.0,
             omniscience_index=omniscience_index,
             is_hallucination=is_hallucination,
         )

@@ -186,6 +186,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("A"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -214,6 +215,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("B"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -238,6 +240,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("C"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -263,6 +266,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("D"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -288,6 +292,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("A"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -309,6 +314,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("A"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -333,13 +339,18 @@ class TestOmniscienceServer:
         assert "is_not_attempted" in dump
         assert "omniscience_index" in dump
         assert "is_hallucination" in dump
+        assert "is_judge_error" in dump
+        assert "judge_error_message" in dump
         assert result.expected_answer == "Test answer"
+        assert result.is_judge_error == approx(0.0)
+        assert result.judge_error_message is None
 
     async def test_verify_empty_response(self, config: OmniscienceConfig) -> None:
         server_mock = MagicMock(spec=ServerClient)
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("D"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -370,6 +381,7 @@ class TestOmniscienceServer:
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("A"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
@@ -390,17 +402,123 @@ class TestOmniscienceServer:
         assert "What is the capital of France?" in judge_input
         assert "Paris" in judge_input
 
-    async def test_verify_no_think_tag_produces_empty(self, config: OmniscienceConfig) -> None:
-        """When model output has no </think>, generation should be empty (matching parse_reasoning=True)."""
+    async def test_verify_judge_error_after_exhausting_retries(self, config: OmniscienceConfig) -> None:
+        config = config.model_copy(update={"judge_max_attempts": 2, "judge_retry_initial_backoff_seconds": 0.0})
         server_mock = MagicMock(spec=ServerClient)
         server = OmniscienceServer(config=config, server_client=server_mock)
 
         response_mock = AsyncMock()
+        response_mock.status = 503
+        response_mock.text = AsyncMock(return_value="Authentication backend unavailable.")
+        server_mock.post = AsyncMock(return_value=response_mock)
+
+        model_response = self._make_model_response("some answer")
+        request = OmniscienceVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=model_response,
+            question="q?",
+            expected_answer="a",
+        )
+
+        result = await server.verify(request)
+        assert result.verdict == "judge_error"
+        assert result.reward == approx(0.0)
+        assert result.is_judge_error == approx(1.0)
+        assert result.is_correct == approx(0.0)
+        assert result.is_incorrect == approx(0.0)
+        assert result.is_partial == approx(0.0)
+        assert result.is_not_attempted == approx(0.0)
+        assert result.omniscience_index == approx(0.0)
+        assert result.is_hallucination == approx(0.0)
+        assert "503" in (result.judge_error_message or "")
+        assert server_mock.post.await_count == config.judge_max_attempts
+
+    async def test_verify_retry_recovers_on_second_attempt(self, config: OmniscienceConfig) -> None:
+        config = config.model_copy(update={"judge_max_attempts": 3, "judge_retry_initial_backoff_seconds": 0.0})
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        fail_mock = AsyncMock()
+        fail_mock.status = 503
+        fail_mock.text = AsyncMock(return_value="transient")
+
+        ok_mock = AsyncMock()
+        ok_mock.status = 200
+        ok_mock.json = AsyncMock(return_value=self._make_judge_response("A"))
+
+        server_mock.post = AsyncMock(side_effect=[fail_mock, ok_mock])
+
+        model_response = self._make_model_response("Paris")
+        request = OmniscienceVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=model_response,
+            question="capital of France?",
+            expected_answer="Paris",
+        )
+
+        result = await server.verify(request)
+        assert result.verdict == "correct"
+        assert result.is_correct == approx(1.0)
+        assert result.is_judge_error == approx(0.0)
+        assert server_mock.post.await_count == 2
+
+    async def test_verify_judge_error_on_non_dict_body(self, config: OmniscienceConfig) -> None:
+        config = config.model_copy(update={"judge_max_attempts": 1, "judge_retry_initial_backoff_seconds": 0.0})
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        response_mock = AsyncMock()
+        response_mock.status = 200
+        response_mock.json = AsyncMock(return_value="Hit an exception in inner server")
+        server_mock.post = AsyncMock(return_value=response_mock)
+
+        model_response = self._make_model_response("some answer")
+        request = OmniscienceVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=model_response,
+            question="q?",
+            expected_answer="a",
+        )
+
+        result = await server.verify(request)
+        assert result.verdict == "judge_error"
+        assert result.is_judge_error == approx(1.0)
+        assert "non_dict_body" in (result.judge_error_message or "")
+
+    async def test_verify_no_think_tag_keeps_raw_generation(self, config: OmniscienceConfig) -> None:
+        """No <think>/<thinking> tags at all: keep raw generation as the model's answer."""
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        response_mock = AsyncMock()
+        response_mock.status = 200
         response_mock.json = AsyncMock(return_value=self._make_judge_response("D"))
         server_mock.post = AsyncMock(return_value=response_mock)
 
-        # Model output without </think> — reasoning that never finished
-        model_response = self._make_model_response("Let me think about this... I'm not sure about the answer")
+        raw = "Let me think about this... I'm not sure about the answer"
+        model_response = self._make_model_response(raw)
+        request = OmniscienceVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=model_response,
+            question="Some question?",
+            expected_answer="Some answer",
+        )
+
+        result = await server.verify(request)
+        assert result.extracted_answer == raw
+        assert result.verdict == "not_attempted"
+
+    async def test_verify_unclosed_think_tag_blanks_generation(self, config: OmniscienceConfig) -> None:
+        """<think> opened but never closed: response was truncated mid-reasoning, blank the generation."""
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        response_mock = AsyncMock()
+        response_mock.status = 200
+        response_mock.json = AsyncMock(return_value=self._make_judge_response("D"))
+        server_mock.post = AsyncMock(return_value=response_mock)
+
+        model_response = self._make_model_response("<think>reasoning that never finished")
         request = OmniscienceVerifyRequest(
             responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
             response=model_response,
@@ -420,22 +538,42 @@ class TestOmniscienceScoreFn:
             "judge_incorrect": 0.0,
             "judge_partially_correct": 0.0,
             "judge_abstained": 0.0,
+            "judge_error": 0.0,
         }
 
     def test_incorrect(self) -> None:
         scores = OmniscienceServer._omni_score_fn({"verdict": "incorrect"})
         assert scores["judge_correct"] == 0.0
         assert scores["judge_incorrect"] == -1.0
+        assert scores["judge_error"] == 0.0
 
     def test_partial(self) -> None:
         scores = OmniscienceServer._omni_score_fn({"verdict": "partial"})
         assert scores["judge_partially_correct"] == 1.0
         assert scores["judge_correct"] == 0.0
+        assert scores["judge_error"] == 0.0
 
     def test_not_attempted(self) -> None:
         scores = OmniscienceServer._omni_score_fn({"verdict": "not_attempted"})
         assert scores["judge_abstained"] == 1.0
         assert scores["judge_correct"] == 0.0
+        assert scores["judge_error"] == 0.0
+
+    def test_judge_error(self) -> None:
+        scores = OmniscienceServer._omni_score_fn({"verdict": "judge_error"})
+        assert scores["judge_correct"] == 0.0
+        assert scores["judge_incorrect"] == 0.0
+        assert scores["judge_partially_correct"] == 0.0
+        assert scores["judge_abstained"] == 0.0
+        assert scores["judge_error"] == 1.0
+
+    def test_unknown_verdict_is_all_zero(self) -> None:
+        scores = OmniscienceServer._omni_score_fn({})
+        assert scores["judge_correct"] == 0.0
+        assert scores["judge_incorrect"] == 0.0
+        assert scores["judge_partially_correct"] == 0.0
+        assert scores["judge_abstained"] == 0.0
+        assert scores["judge_error"] == 0.0
 
 
 class TestExtractTextNoStrip:
