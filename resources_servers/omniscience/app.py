@@ -48,6 +48,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ModelServerRef
+from nemo_gym.judge import JudgeFailureMixin, judge_failure_metrics, run_judge
 from nemo_gym.openai_utils import (
     NeMoGymChatCompletion,
     NeMoGymChatCompletionCreateParamsNonStreaming,
@@ -178,19 +179,17 @@ class OmniscienceVerifyRequest(OmniscienceRunRequest, BaseVerifyRequest):
     pass
 
 
-class OmniscienceVerifyResponse(BaseVerifyResponse):
+class OmniscienceVerifyResponse(JudgeFailureMixin, BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
 
     extracted_answer: Optional[str] = None
     expected_answer: Optional[str] = None
     verdict: Optional[str] = None
     judge_output: Optional[str] = None
-    judge_error_message: Optional[str] = None
     is_correct: float = 0.0
     is_incorrect: float = 0.0
     is_partial: float = 0.0
     is_not_attempted: float = 0.0
-    is_judge_error: float = 0.0
     omniscience_index: float = 0.0
     is_hallucination: float = 0.0
 
@@ -217,18 +216,29 @@ class OmniscienceServer(SimpleResourcesServer):
         """Score function for compute_pass_majority_metrics.
 
         Maps judge verdicts to named scores matching Skills' OmniMetrics.
-        A verdict of ``judge_error`` (bounded-retry judge call failed) contributes
-        0.0 to every A/B/C/D bucket -- the sample is still counted in the
-        denominator so accuracy is diluted, but it is excluded from the
-        hallucination denominator, mirroring nemo-skills' OmniMetrics behavior.
+        A sample with ``judge_failed=True`` (bounded-retry judge call failed
+        or the judge coroutine raised) contributes 0.0 to every A/B/C/D
+        bucket -- the sample is still counted in the denominator so accuracy
+        is diluted (the "count failed as 0.0" score), but it is excluded
+        from the hallucination denominator, mirroring nemo-skills'
+        OmniMetrics behavior. The parallel ``reward[judge_ok_only]`` metric
+        emitted by :func:`judge_failure_metrics` is the "skip failed" score;
+        ``mean/judge_failed`` is emitted automatically by RewardProfiler on
+        the mixin's bool field.
         """
+        if result.get("judge_failed"):
+            return {
+                "judge_correct": 0.0,
+                "judge_incorrect": 0.0,
+                "judge_partially_correct": 0.0,
+                "judge_abstained": 0.0,
+            }
         verdict = result.get("verdict", "")
         return {
             "judge_correct": 1.0 if verdict == "correct" else 0.0,
             "judge_incorrect": -1.0 if verdict == "incorrect" else 0.0,
             "judge_partially_correct": 1.0 if verdict == "partial" else 0.0,
             "judge_abstained": 1.0 if verdict == "not_attempted" else 0.0,
-            "judge_error": 1.0 if verdict == "judge_error" else 0.0,
         }
 
     def compute_metrics(self, tasks: List[List[dict]]) -> dict:
@@ -253,6 +263,7 @@ class OmniscienceServer(SimpleResourcesServer):
                 metrics[f"{agg}/judge_omni_index"] = correct - incorrect
                 metrics[f"{agg}/judge_omni_hallucination"] = 100 * incorrect / non_correct if non_correct > 0 else 0
 
+        metrics.update(judge_failure_metrics(tasks))
         return metrics
 
     def get_key_metrics(self, agent_metrics: dict) -> dict:
@@ -263,18 +274,24 @@ class OmniscienceServer(SimpleResourcesServer):
                 key[name] = agent_metrics[name]
         key.update(highest_k_metrics(agent_metrics, "pass@1[avg-of-{k}]"))
         key.update(highest_k_metrics(agent_metrics, "pass@{k}", exclude_names=["no_answer"]))
+        for name in ("judge_failures", "mean/judge_failed", "reward[judge_ok_only]"):
+            if name in agent_metrics:
+                key[name] = agent_metrics[name]
         return key
 
     async def _fetch_judge_body(self, url_path: str, json_body) -> Tuple[Optional[dict], str]:
-        response_obj = await self.server_client.post(
-            server_name=self.config.judge_model_server.name,
-            url_path=url_path,
-            json=json_body,
-        )
-        if response_obj.status != 200:
-            body_text = await response_obj.text()
-            return None, f"status={response_obj.status} body_prefix={body_text[:200]}"
-        parsed = await response_obj.json()
+        try:
+            response_obj = await self.server_client.post(
+                server_name=self.config.judge_model_server.name,
+                url_path=url_path,
+                json=json_body,
+            )
+            if response_obj.status != 200:
+                body_text = await response_obj.text()
+                return None, f"status={response_obj.status} body_prefix={body_text[:200]}"
+            parsed = await response_obj.json()
+        except Exception as exc:  # noqa: BLE001 -- surface transport failures as retryable judge errors
+            return None, f"transport_error {type(exc).__name__}: {exc}"
         if not isinstance(parsed, dict):
             return None, f"status=200 non_dict_body type={type(parsed).__name__} preview={str(parsed)[:200]}"
         return parsed, ""
@@ -350,19 +367,24 @@ class OmniscienceServer(SimpleResourcesServer):
                 temperature=self.config.judge_responses_create_params.temperature or 0.0,
                 top_p=self.config.judge_responses_create_params.top_p or 1.0,
             )
-            judge_text, judge_error = await self._call_judge_chat_with_retry(chat_params)
+            judge_call = self._call_judge_chat_with_retry(chat_params)
         else:
             msgs: List[NeMoGymEasyInputMessage] = [
                 NeMoGymEasyInputMessage(role="user", content=judge_prompt),
             ]
             request_params = self.config.judge_responses_create_params.model_copy(deep=True)
             request_params.input = msgs
-            judge_text, judge_error = await self._call_judge_responses_with_retry(request_params)
+            judge_call = self._call_judge_responses_with_retry(request_params)
+
+        outcome, raised_reason = await run_judge(judge_call)
+        if raised_reason is not None:
+            judge_text, judge_error = None, raised_reason
+        else:
+            judge_text, judge_error = outcome  # type: ignore[misc]
 
         if judge_error is not None:
             print(
-                f"[omniscience verify] judge_error after {self.config.judge_max_attempts} "
-                f"attempts: {judge_error}",
+                f"[omniscience verify] judge_failed after {self.config.judge_max_attempts} attempts: {judge_error}",
                 flush=True,
             )
             return OmniscienceVerifyResponse(
@@ -370,14 +392,14 @@ class OmniscienceServer(SimpleResourcesServer):
                 reward=0.0,
                 extracted_answer=generation,
                 expected_answer=expected_answer,
-                verdict="judge_error",
+                verdict=None,
                 judge_output="",
-                judge_error_message=judge_error,
+                judge_failed=True,
+                judge_failure_reason=judge_error,
                 is_correct=0.0,
                 is_incorrect=0.0,
                 is_partial=0.0,
                 is_not_attempted=0.0,
-                is_judge_error=1.0,
                 omniscience_index=0.0,
                 is_hallucination=0.0,
             )
@@ -415,7 +437,6 @@ class OmniscienceServer(SimpleResourcesServer):
             is_incorrect=is_incorrect,
             is_partial=is_partial,
             is_not_attempted=is_not_attempted,
-            is_judge_error=0.0,
             omniscience_index=omniscience_index,
             is_hallucination=is_hallucination,
         )
