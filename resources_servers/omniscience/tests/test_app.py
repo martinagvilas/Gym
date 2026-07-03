@@ -14,6 +14,7 @@
 # limitations under the License.
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from pytest import approx, fixture
 
 from nemo_gym.config_types import ModelServerRef
@@ -32,6 +33,7 @@ from resources_servers.omniscience.app import (
     extract_text_from_response,
     parse_judge_grade,
 )
+from nemo_gym.judge import JudgeFailureMixin, judge_failure_metrics, run_judge
 
 
 class TestStripThinkingTraces:
@@ -339,11 +341,11 @@ class TestOmniscienceServer:
         assert "is_not_attempted" in dump
         assert "omniscience_index" in dump
         assert "is_hallucination" in dump
-        assert "is_judge_error" in dump
-        assert "judge_error_message" in dump
+        assert "judge_failed" in dump
+        assert "judge_failure_reason" in dump
         assert result.expected_answer == "Test answer"
-        assert result.is_judge_error == approx(0.0)
-        assert result.judge_error_message is None
+        assert result.judge_failed is False
+        assert result.judge_failure_reason is None
 
     async def test_verify_empty_response(self, config: OmniscienceConfig) -> None:
         server_mock = MagicMock(spec=ServerClient)
@@ -421,16 +423,16 @@ class TestOmniscienceServer:
         )
 
         result = await server.verify(request)
-        assert result.verdict == "judge_error"
+        assert result.verdict is None
         assert result.reward == approx(0.0)
-        assert result.is_judge_error == approx(1.0)
+        assert result.judge_failed is True
         assert result.is_correct == approx(0.0)
         assert result.is_incorrect == approx(0.0)
         assert result.is_partial == approx(0.0)
         assert result.is_not_attempted == approx(0.0)
         assert result.omniscience_index == approx(0.0)
         assert result.is_hallucination == approx(0.0)
-        assert "503" in (result.judge_error_message or "")
+        assert "503" in (result.judge_failure_reason or "")
         assert server_mock.post.await_count == config.judge_max_attempts
 
     async def test_verify_retry_recovers_on_second_attempt(self, config: OmniscienceConfig) -> None:
@@ -459,7 +461,7 @@ class TestOmniscienceServer:
         result = await server.verify(request)
         assert result.verdict == "correct"
         assert result.is_correct == approx(1.0)
-        assert result.is_judge_error == approx(0.0)
+        assert result.judge_failed is False
         assert server_mock.post.await_count == 2
 
     async def test_verify_judge_error_on_non_dict_body(self, config: OmniscienceConfig) -> None:
@@ -481,9 +483,9 @@ class TestOmniscienceServer:
         )
 
         result = await server.verify(request)
-        assert result.verdict == "judge_error"
-        assert result.is_judge_error == approx(1.0)
-        assert "non_dict_body" in (result.judge_error_message or "")
+        assert result.verdict is None
+        assert result.judge_failed is True
+        assert "non_dict_body" in (result.judge_failure_reason or "")
 
     async def test_verify_no_think_tag_keeps_raw_generation(self, config: OmniscienceConfig) -> None:
         """No <think>/<thinking> tags at all: keep raw generation as the model's answer."""
@@ -538,42 +540,45 @@ class TestOmniscienceScoreFn:
             "judge_incorrect": 0.0,
             "judge_partially_correct": 0.0,
             "judge_abstained": 0.0,
-            "judge_error": 0.0,
         }
 
     def test_incorrect(self) -> None:
         scores = OmniscienceServer._omni_score_fn({"verdict": "incorrect"})
         assert scores["judge_correct"] == 0.0
         assert scores["judge_incorrect"] == -1.0
-        assert scores["judge_error"] == 0.0
 
     def test_partial(self) -> None:
         scores = OmniscienceServer._omni_score_fn({"verdict": "partial"})
         assert scores["judge_partially_correct"] == 1.0
         assert scores["judge_correct"] == 0.0
-        assert scores["judge_error"] == 0.0
 
     def test_not_attempted(self) -> None:
         scores = OmniscienceServer._omni_score_fn({"verdict": "not_attempted"})
         assert scores["judge_abstained"] == 1.0
         assert scores["judge_correct"] == 0.0
-        assert scores["judge_error"] == 0.0
 
-    def test_judge_error(self) -> None:
-        scores = OmniscienceServer._omni_score_fn({"verdict": "judge_error"})
+    def test_judge_failed_is_all_zero(self) -> None:
+        """judge_failed samples emit 0.0 for every bucket; mean/judge_failed comes from RewardProfiler."""
+        scores = OmniscienceServer._omni_score_fn({"judge_failed": True})
+        assert scores == {
+            "judge_correct": 0.0,
+            "judge_incorrect": 0.0,
+            "judge_partially_correct": 0.0,
+            "judge_abstained": 0.0,
+        }
+
+    def test_judge_failed_overrides_any_verdict(self) -> None:
+        scores = OmniscienceServer._omni_score_fn({"judge_failed": True, "verdict": "correct"})
         assert scores["judge_correct"] == 0.0
-        assert scores["judge_incorrect"] == 0.0
-        assert scores["judge_partially_correct"] == 0.0
-        assert scores["judge_abstained"] == 0.0
-        assert scores["judge_error"] == 1.0
 
     def test_unknown_verdict_is_all_zero(self) -> None:
         scores = OmniscienceServer._omni_score_fn({})
-        assert scores["judge_correct"] == 0.0
-        assert scores["judge_incorrect"] == 0.0
-        assert scores["judge_partially_correct"] == 0.0
-        assert scores["judge_abstained"] == 0.0
-        assert scores["judge_error"] == 0.0
+        assert scores == {
+            "judge_correct": 0.0,
+            "judge_incorrect": 0.0,
+            "judge_partially_correct": 0.0,
+            "judge_abstained": 0.0,
+        }
 
 
 class TestExtractTextNoStrip:
@@ -604,3 +609,235 @@ class TestExtractTextNoStrip:
     def test_strip_true_removes_reasoning(self) -> None:
         response = self._make_response("reasoning here</think>answer")
         assert extract_text_from_response(response, strip_thinking=True) == "answer"
+
+
+class TestRunJudge:
+    @pytest.mark.asyncio
+    async def test_success_returns_result_and_none(self) -> None:
+        async def ok() -> str:
+            return "hello"
+
+        result, reason = await run_judge(ok())
+        assert result == "hello"
+        assert reason is None
+
+    @pytest.mark.asyncio
+    async def test_exception_becomes_reason(self) -> None:
+        async def boom() -> str:
+            raise RuntimeError("judge exploded")
+
+        result, reason = await run_judge(boom())
+        assert result is None
+        assert reason is not None
+        assert "RuntimeError" in reason
+        assert "judge exploded" in reason
+
+    @pytest.mark.asyncio
+    async def test_pydantic_validation_error_becomes_reason(self) -> None:
+        from pydantic import ValidationError
+
+        async def bad_body() -> str:
+            NeMoGymResponse.model_validate({"not": "valid"})
+            return "unreachable"
+
+        result, reason = await run_judge(bad_body())
+        assert result is None
+        assert reason is not None
+        assert "ValidationError" in reason
+        _ = ValidationError
+
+
+class TestJudgeFailureMetrics:
+    """Sanity-check the nemo_gym.judge helper as consumed by omniscience.
+
+    The canonical unit tests live in tests/unit_tests/test_judge.py -- these
+    duplicate the shape assertions so a Gym-side regression surfaces in the
+    omniscience test run too.
+    """
+
+    def test_no_failures(self) -> None:
+        tasks = [[{"reward": 1.0, "judge_failed": False}, {"reward": 0.0, "judge_failed": False}]]
+        m = judge_failure_metrics(tasks)
+        assert m["judge_failures"] == 0
+        assert m["reward[judge_ok_only]"] == approx(0.5)
+
+    def test_all_failures(self) -> None:
+        tasks = [[{"reward": 0.0, "judge_failed": True}, {"reward": 0.0, "judge_failed": True}]]
+        m = judge_failure_metrics(tasks)
+        assert m["judge_failures"] == 2
+        assert m["reward[judge_ok_only]"] is None
+
+    def test_partial_failures_split_scores(self) -> None:
+        tasks = [
+            [
+                {"reward": 1.0, "judge_failed": False},
+                {"reward": 0.0, "judge_failed": True},
+                {"reward": 1.0, "judge_failed": False},
+            ]
+        ]
+        m = judge_failure_metrics(tasks)
+        assert m["judge_failures"] == 1
+        assert m["reward[judge_ok_only]"] == approx(1.0)
+
+    def test_empty_tasks(self) -> None:
+        assert judge_failure_metrics([]) == {}
+
+    def test_missing_judge_failed_treated_as_ok(self) -> None:
+        tasks = [[{"reward": 1.0}, {"reward": 0.5}]]
+        m = judge_failure_metrics(tasks)
+        assert m["judge_failures"] == 0
+        assert m["reward[judge_ok_only]"] == approx(0.75)
+
+
+class TestJudgeFailureMixin:
+    def test_defaults(self) -> None:
+        instance = JudgeFailureMixin()
+        assert instance.judge_failed is False
+        assert instance.judge_failure_reason is None
+
+    def test_setting_reason(self) -> None:
+        instance = JudgeFailureMixin(judge_failed=True, judge_failure_reason="ClientError: rate limit")
+        assert instance.judge_failed is True
+        assert instance.judge_failure_reason == "ClientError: rate limit"
+
+
+class TestComputeMetricsBothScores:
+    """End-to-end: mixed batch of correct + incorrect + judge_failed samples
+    yields both the "count failed as 0.0" score and the "skip failed" score
+    from the same compute_metrics(tasks) call. Mirrors Ewa's stated core
+    feature: two headline scores side by side.
+    """
+
+    @fixture
+    def config(self) -> OmniscienceConfig:
+        return OmniscienceConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            judge_model_server=ModelServerRef(type="responses_api_models", name="judge_model"),
+            judge_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+        )
+
+    def _rollout(self, *, verdict: str | None, reward: float, judge_failed: bool = False) -> dict:
+        return {
+            "extracted_answer": "some answer" if not judge_failed else "",
+            "verdict": verdict,
+            "reward": reward,
+            "judge_failed": judge_failed,
+            "judge_failure_reason": "simulated" if judge_failed else None,
+            "is_correct": 1.0 if verdict == "correct" else 0.0,
+            "is_incorrect": 1.0 if verdict == "incorrect" else 0.0,
+            "is_partial": 1.0 if verdict == "partial" else 0.0,
+            "is_not_attempted": 1.0 if verdict == "not_attempted" else 0.0,
+        }
+
+    def test_mixed_batch_emits_both_scores(self, config: OmniscienceConfig) -> None:
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        tasks = [
+            [self._rollout(verdict="correct", reward=1.0)],
+            [self._rollout(verdict="incorrect", reward=0.0)],
+            [self._rollout(verdict="correct", reward=1.0)],
+            [self._rollout(verdict=None, reward=0.0, judge_failed=True)],
+        ]
+
+        metrics = server.compute_metrics(tasks)
+
+        assert metrics["judge_failures"] == 1
+        assert metrics["reward[judge_ok_only]"] == approx(2.0 / 3.0)
+
+        assert metrics["pass@1/judge_correct"] == approx(50.0)
+        assert "pass@1/judge_omni_index" in metrics
+        assert "pass@1/judge_omni_hallucination" in metrics
+
+    def test_all_ok_batch(self, config: OmniscienceConfig) -> None:
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        tasks = [
+            [self._rollout(verdict="correct", reward=1.0)],
+            [self._rollout(verdict="incorrect", reward=0.0)],
+        ]
+        metrics = server.compute_metrics(tasks)
+
+        assert metrics["judge_failures"] == 0
+        assert metrics["reward[judge_ok_only]"] == approx(0.5)
+
+    def test_all_failed_batch_reward_ok_only_is_none(self, config: OmniscienceConfig) -> None:
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        tasks = [[self._rollout(verdict=None, reward=0.0, judge_failed=True)] for _ in range(3)]
+        metrics = server.compute_metrics(tasks)
+
+        assert metrics["judge_failures"] == 3
+        assert metrics["reward[judge_ok_only]"] is None
+
+    def test_get_key_metrics_promotes_judge_failure_signals(self, config: OmniscienceConfig) -> None:
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        tasks = [
+            [self._rollout(verdict="correct", reward=1.0)],
+            [self._rollout(verdict=None, reward=0.0, judge_failed=True)],
+        ]
+        metrics = server.compute_metrics(tasks)
+        key = server.get_key_metrics(metrics)
+
+        assert "judge_failures" in key
+        assert "reward[judge_ok_only]" in key
+
+
+class TestVerifyExceptionPath:
+    @fixture
+    def config(self) -> OmniscienceConfig:
+        return OmniscienceConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            judge_model_server=ModelServerRef(type="responses_api_models", name="judge_model"),
+            judge_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+        )
+
+    async def test_client_error_becomes_judge_failed(self, config: OmniscienceConfig) -> None:
+        config = config.model_copy(update={"judge_max_attempts": 2, "judge_retry_initial_backoff_seconds": 0.0})
+        server_mock = MagicMock(spec=ServerClient)
+        server = OmniscienceServer(config=config, server_client=server_mock)
+
+        server_mock.post = AsyncMock(side_effect=ConnectionResetError("peer closed"))
+
+        policy_response = NeMoGymResponse(
+            id="policy_resp",
+            created_at=0.0,
+            model="policy_model",
+            object="response",
+            output=[
+                NeMoGymResponseOutputMessage(
+                    id="msg",
+                    content=[NeMoGymResponseOutputText(annotations=[], text="some answer", type="output_text")],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+            ],
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+        request = OmniscienceVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=policy_response,
+            question="q?",
+            expected_answer="a",
+        )
+
+        result = await server.verify(request)
+        assert result.verdict is None
+        assert result.judge_failed is True
+        assert result.reward == approx(0.0)
+        assert result.judge_failure_reason is not None
+        assert "ConnectionResetError" in result.judge_failure_reason or "transport_error" in result.judge_failure_reason
+        assert server_mock.post.await_count == config.judge_max_attempts
